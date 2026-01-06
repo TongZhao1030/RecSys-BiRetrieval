@@ -9,9 +9,6 @@ data/
 *.pt
 *.bin
 
-# 生成的图片
-*.png
-
 # Python
 __pycache__/
 *.py[cod]

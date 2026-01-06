@@ -30,6 +30,7 @@ transformers
 datasets
 accelerate
 huggingface_hub
+gradio
 ```
 
 ## 使用方法
@@ -56,11 +57,20 @@ accelerate launch train.py
 python inference_valid.py
 ```
 
+**4. 启动 Web Demo**
+
+```bash
+python app.py
+```
+运行后会生成访问链接
+
+
 ## 项目结构
 
 ```
 ├── train.py           # 训练脚本
 ├── inference_valid.py # 双向检索评估
+├── app.py             # Gradio Web Demo
 ├── down_util.py       # 模型与数据下载工具
 └── heat_map.py        # 相似度热力图可视化
 ```
