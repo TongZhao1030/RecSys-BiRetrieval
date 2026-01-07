@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import os
 import gradio as gr
 from transformers import AutoModel, AutoTokenizer
 from datasets import load_from_disk
@@ -14,10 +15,38 @@ from datasets import load_from_disk
 # 配置
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PATH_MODEL = "dual_tower_final.pth"
-PATH_SAPROT = "./models/SaProt_650M_AF2"
-PATH_CHEMBERTA = "./models/ChemBERTa-zinc-base-v1"
-PATH_DATA = "./data/bindingdb_local"
+PATH_SAPROT = "/share/home/zhangchiLab/duyinuo/models/westlake-repl_SaProt_650M_AF2"
+PATH_CHEMBERTA = "/share/home/zhangchiLab/duyinuo/models/seyonec_ChemBERTa-zinc-base-v1"
+PATH_DATA = "/share/home/zhangchiLab/duyinuo/data/vladak_bindingdb"
 TOP_K = 10
+
+def resolve_split_dataset_path(data_path, split):
+    if split:
+        candidate = os.path.join(data_path, split)
+        if os.path.isdir(candidate):
+            return candidate
+    for default_split in ("train", "test", "valid", "validation"):
+        candidate = os.path.join(data_path, default_split)
+        if os.path.isdir(candidate):
+            return candidate
+    return data_path
+
+def infer_text_column(cols, *, kind):
+    cols = list(cols or [])
+    if kind == "protein":
+        preferred = ["Protein Sequence", "protein_sequence", "protein", "target_sequence", "target"]
+        needles = ("protein", "target", "sequence")
+    else:
+        preferred = ["Molecule Sequence", "molecule_sequence", "smiles", "ligand", "molecule", "drug"]
+        needles = ("smiles", "ligand", "molecule", "drug")
+    for c in preferred:
+        if c in cols:
+            return c
+    for c in cols:
+        low = c.lower()
+        if any(n in low for n in needles):
+            return c
+    return None
 
 # 模型定义
 class DualTowerModel(nn.Module):
@@ -83,14 +112,18 @@ def load_model():
     
     # 加载数据库
     print("正在构建检索数据库...")
-    dataset = load_from_disk(PATH_DATA)
+    dataset = load_from_disk(resolve_split_dataset_path(PATH_DATA, "train"))
+    protein_col = infer_text_column(dataset.column_names, kind="protein")
+    molecule_col = infer_text_column(dataset.column_names, kind="molecule")
+    if protein_col is None or molecule_col is None:
+        raise ValueError(f"无法推断列名；现有列: {dataset.column_names}")
     
     seen_prots = set()
     seen_mols = set()
     
     for idx in range(min(len(dataset), 5000)):  # 限制数据库大小
-        prot = dataset[idx]['Protein Sequence']
-        mol = dataset[idx]['Molecule Sequence']
+        prot = dataset[idx][protein_col]
+        mol = dataset[idx][molecule_col]
         
         if prot not in seen_prots:
             seen_prots.add(prot)
@@ -288,4 +321,3 @@ with gr.Blocks(title="蛋白质-分子双向检索", theme=gr.themes.Soft()) as 
 if __name__ == "__main__":
     load_model()
     demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
-

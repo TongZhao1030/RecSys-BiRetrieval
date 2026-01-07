@@ -9,6 +9,7 @@
 
 import torch
 import torch.nn as nn
+import os
 from transformers import AutoModel, AutoTokenizer
 from datasets import load_from_disk
 import torch.nn.functional as F
@@ -18,12 +19,40 @@ from collections import defaultdict
 # 配置参数
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PATH_MODEL = "dual_tower_final.pth"
-PATH_SAPROT = "./models/SaProt_650M_AF2"
-PATH_CHEMBERTA = "./models/ChemBERTa-zinc-base-v1"
-PATH_DATA = "./data/bindingdb_local"
+PATH_SAPROT = "/share/home/zhangchiLab/duyinuo/models/westlake-repl_SaProt_650M_AF2"
+PATH_CHEMBERTA = "/share/home/zhangchiLab/duyinuo/models/seyonec_ChemBERTa-zinc-base-v1"
+PATH_DATA = "/share/home/zhangchiLab/duyinuo/data/vladak_bindingdb"
 TEST_SIZE = 100
 
 print(f"启动双向检索验证，设备: {DEVICE}")
+
+def resolve_split_dataset_path(data_path, split):
+    if split:
+        candidate = os.path.join(data_path, split)
+        if os.path.isdir(candidate):
+            return candidate
+    for default_split in ("test", "train", "valid", "validation"):
+        candidate = os.path.join(data_path, default_split)
+        if os.path.isdir(candidate):
+            return candidate
+    return data_path
+
+def infer_text_column(cols, *, kind):
+    cols = list(cols or [])
+    if kind == "protein":
+        preferred = ["Protein Sequence", "protein_sequence", "protein", "target_sequence", "target"]
+        needles = ("protein", "target", "sequence")
+    else:
+        preferred = ["Molecule Sequence", "molecule_sequence", "smiles", "ligand", "molecule", "drug"]
+        needles = ("smiles", "ligand", "molecule", "drug")
+    for c in preferred:
+        if c in cols:
+            return c
+    for c in cols:
+        low = c.lower()
+        if any(n in low for n in needles):
+            return c
+    return None
 
 # 模型定义（与训练脚本完全一致）
 class DualTowerModel(nn.Module):
@@ -97,7 +126,11 @@ except Exception as e:
 
 mol_tokenizer = AutoTokenizer.from_pretrained(PATH_CHEMBERTA)
 prot_tokenizer = AutoTokenizer.from_pretrained(PATH_SAPROT, trust_remote_code=True)
-dataset = load_from_disk(PATH_DATA)
+dataset = load_from_disk(resolve_split_dataset_path(PATH_DATA, "test"))
+protein_col = infer_text_column(dataset.column_names, kind="protein")
+molecule_col = infer_text_column(dataset.column_names, kind="molecule")
+if protein_col is None or molecule_col is None:
+    raise ValueError(f"无法推断列名；现有列: {dataset.column_names}")
 
 # 准备测试数据（选择配对数据）
 print("\n正在准备测试数据...")
@@ -107,8 +140,8 @@ prot_to_mols = defaultdict(set)
 mol_to_prots = defaultdict(set)
 
 for idx in range(len(dataset)):
-    prot = dataset[idx]['Protein Sequence']
-    mol = dataset[idx]['Molecule Sequence']
+    prot = dataset[idx][protein_col]
+    mol = dataset[idx][molecule_col]
     prot_to_mols[prot].add(mol)
     mol_to_prots[mol].add(prot)
 
@@ -119,8 +152,8 @@ seen_mols = set()
 test_pairs = []  # [(prot, mol), ...]
 
 for idx in range(len(dataset)):
-    prot = dataset[idx]['Protein Sequence']
-    mol = dataset[idx]['Molecule Sequence']
+    prot = dataset[idx][protein_col]
+    mol = dataset[idx][molecule_col]
     
     # 确保蛋白质和分子都是唯一的
     if prot not in seen_prots and mol not in seen_mols:
