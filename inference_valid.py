@@ -17,6 +17,8 @@ from collections import defaultdict
 from transformers import AutoModel, AutoTokenizer
 from datasets import load_from_disk
 from tqdm import tqdm
+import os
+from datetime import datetime
 
 # ============================================================================
 # 配置
@@ -200,9 +202,118 @@ def build_global_database(dataset, positive_threshold=POSITIVE_THRESHOLD):
     return proteins, molecules, prot_to_idx, mol_to_idx, prot_positives, mol_positives
 
 # ============================================================================
+# 结果保存函数
+# ============================================================================
+def save_results_to_file(results_dict, output_dir="./outputs"):
+    """保存评估结果到文件"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 生成文件名
+    filename = "validation_results.txt"
+    filepath = os.path.join(output_dir, filename)
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        # 写入标题
+        f.write("=" * 70 + "\n")
+        f.write("蛋白质-分子双向检索验证结果\n")
+        f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 70 + "\n\n")
+        
+        # 写入配置信息
+        f.write("配置信息:\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"设备: {results_dict['device']}\n")
+        f.write(f"正样本阈值: pIC50 >= {results_dict['positive_threshold']}\n")
+        f.write(f"蛋白质库大小: {results_dict['n_proteins']}\n")
+        f.write(f"分子库大小: {results_dict['n_molecules']}\n")
+        f.write(f"温度参数: {results_dict['temperature']:.4f}\n\n")
+        
+        # 写入数据库统计
+        f.write("数据库统计:\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"有正样本的蛋白质数: {results_dict['prots_with_positives']}\n")
+        f.write(f"有正样本的分子数: {results_dict['mols_with_positives']}\n")
+        f.write(f"正样本配对数: {results_dict['total_positive_pairs']}\n\n")
+        
+        # 写入P→M结果
+        f.write("=" * 70 + "\n")
+        f.write("评估: Protein → Molecule (全局检索)\n")
+        f.write(f"从 {results_dict['n_molecules']} 个分子中检索\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"有正样本的蛋白质数: {results_dict['n_p2m_queries']}\n\n")
+        f.write(f"Protein → Molecule 结果 (n={results_dict['n_p2m_queries']}, 分子库={results_dict['n_molecules']}):\n")
+        for k in results_dict['top_k_list']:
+            f.write(f"  Recall@{k}: {results_dict['p2m_recall'][k]/results_dict['n_p2m_queries']*100:.2f}%\n")
+        f.write(f"  MRR: {results_dict['p2m_mrr']/results_dict['n_p2m_queries']:.4f}\n\n")
+        
+        # 写入M→P结果
+        f.write("=" * 70 + "\n")
+        f.write("评估: Molecule → Protein (全局检索)\n")
+        f.write(f"从 {results_dict['n_proteins']} 个蛋白质中检索\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"有正样本的分子数: {results_dict['n_m2p_queries']}\n\n")
+        f.write(f"Molecule → Protein 结果 (n={results_dict['n_m2p_queries']}, 蛋白质库={results_dict['n_proteins']}):\n")
+        for k in results_dict['top_k_list']:
+            f.write(f"  Recall@{k}: {results_dict['m2p_recall'][k]/results_dict['n_m2p_queries']*100:.2f}%\n")
+        f.write(f"  MRR: {results_dict['m2p_mrr']/results_dict['n_m2p_queries']:.4f}\n\n")
+        
+        # 写入汇总结果
+        f.write("=" * 70 + "\n")
+        f.write("汇总\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"        P→M       M→P       平均\n")
+        f.write("-" * 45 + "\n")
+        for k in results_dict['top_k_list']:
+            p2m = results_dict['p2m_recall'][k]/results_dict['n_p2m_queries']*100
+            m2p = results_dict['m2p_recall'][k]/results_dict['n_m2p_queries']*100
+            avg = (p2m + m2p) / 2
+            f.write(f"R@{k:<3}   {p2m:5.2f}%    {m2p:5.2f}%    {avg:5.2f}%\n")
+        
+        p2m_mrr_val = results_dict['p2m_mrr']/results_dict['n_p2m_queries']
+        m2p_mrr_val = results_dict['m2p_mrr']/results_dict['n_m2p_queries']
+        avg_mrr = (p2m_mrr_val + m2p_mrr_val) / 2
+        f.write(f"MRR     {p2m_mrr_val:.4f}    {m2p_mrr_val:.4f}    {avg_mrr:.4f}\n\n")
+        
+        # 写入示例展示
+        if 'example_results' in results_dict:
+            f.write("=" * 70 + "\n")
+            f.write("示例展示\n")
+            f.write("=" * 70 + "\n\n")
+            
+            example = results_dict['example_results']
+            f.write(f"【查询蛋白质】{example['protein'][:60]}...\n")
+            f.write(f"该蛋白质在分子库中有 {example['n_positives']} 个正样本分子\n\n")
+            
+            f.write("模型检索 Top-10:\n")
+            for i, (mol, score, is_pos) in enumerate(example['top10'], 1):
+                label = "✓ 正样本" if is_pos else "✗ 负样本"
+                f.write(f"  {i:2d}. {mol[:50]}... | score={score:.4f} | {label}\n")
+            
+            f.write(f"\n正样本分子的排名:\n")
+            for rank, mol, score in example['positive_ranks'][:5]:
+                f.write(f"  排名 {rank}: {mol[:50]}... | score={score:.4f}\n")
+            
+            if example['positive_ranks']:
+                ranks = [r[0] for r in example['positive_ranks']]
+                f.write(f"\n  最高排名: {min(ranks)}, 平均排名: {np.mean(ranks):.1f}\n")
+        
+        f.write("\n" + "=" * 70 + "\n")
+        f.write("评估完成\n")
+        f.write("=" * 70 + "\n")
+    
+    return filepath
+
+# ============================================================================
 # 主评估流程
 # ============================================================================
 def main():
+    # 初始化结果字典
+    results_dict = {
+        'device': str(DEVICE),
+        'positive_threshold': POSITIVE_THRESHOLD,
+        'top_k_list': TOP_K_LIST
+    }
+    
     # 加载模型
     print("\n加载模型...")
     model = DualTowerModel(PATH_SAPROT, PATH_CHEMBERTA).to(DEVICE)
@@ -218,6 +329,7 @@ def main():
     model.eval()
     
     temp = model.get_temperature().item()
+    results_dict['temperature'] = temp
     print(f"模型加载成功，温度参数: {temp:.4f}")
     
     # 加载 tokenizer
@@ -231,6 +343,15 @@ def main():
     # 构建全局数据库
     proteins, molecules, prot_to_idx, mol_to_idx, prot_positives, mol_positives = \
         build_global_database(test_dataset, POSITIVE_THRESHOLD)
+    
+    # 保存数据库信息到结果字典
+    results_dict.update({
+        'n_proteins': len(proteins),
+        'n_molecules': len(molecules),
+        'prots_with_positives': sum(1 for p_idx in range(len(proteins)) if len(prot_positives[p_idx]) > 0),
+        'mols_with_positives': sum(1 for m_idx in range(len(molecules)) if len(mol_positives[m_idx]) > 0),
+        'total_positive_pairs': sum(len(v) for v in prot_positives.values())
+    })
     
     # ========================================================================
     # 预计算所有向量
@@ -310,6 +431,13 @@ def main():
     
     n_p2m_queries = len(query_prot_indices)
     
+    # 保存P→M结果
+    results_dict.update({
+        'n_p2m_queries': n_p2m_queries,
+        'p2m_recall': p2m_recall,
+        'p2m_mrr': p2m_mrr
+    })
+    
     print(f"\nProtein → Molecule 结果 (n={n_p2m_queries}, 分子库={len(molecules)}):")
     for k in TOP_K_LIST:
         print(f"  Recall@{k}: {p2m_recall[k]/n_p2m_queries*100:.2f}%")
@@ -357,6 +485,13 @@ def main():
                 break
     
     n_m2p_queries = len(query_mol_indices)
+    
+    # 保存M→P结果
+    results_dict.update({
+        'n_m2p_queries': n_m2p_queries,
+        'm2p_recall': m2p_recall,
+        'm2p_mrr': m2p_mrr
+    })
     
     print(f"\nMolecule → Protein 结果 (n={n_m2p_queries}, 蛋白质库={len(proteins)}):")
     for k in TOP_K_LIST:
@@ -425,6 +560,31 @@ def main():
     
     if pos_ranks:
         print(f"\n  最高排名: {min(pos_ranks)}, 平均排名: {np.mean(pos_ranks):.1f}")
+    
+    # 保存示例结果
+    example_top10 = []
+    for rank, mol_idx in enumerate(sorted_indices[:10], 1):
+        mol = molecules[mol_idx]
+        is_pos = mol_idx in example_positives
+        example_top10.append((mol, scores[mol_idx], is_pos))
+    
+    example_pos_ranks = []
+    for rank, mol_idx in enumerate(sorted_indices, 1):
+        if mol_idx in example_positives:
+            mol = molecules[mol_idx]
+            example_pos_ranks.append((rank, mol, scores[mol_idx]))
+    
+    results_dict['example_results'] = {
+        'protein': example_prot,
+        'n_positives': len(example_positives),
+        'top10': example_top10,
+        'positive_ranks': example_pos_ranks
+    }
+    
+    # 保存结果到文件
+    print("\n保存结果到文件...")
+    saved_filepath = save_results_to_file(results_dict)
+    print(f"结果已保存到: {saved_filepath}")
     
     print("\n" + "=" * 70)
     print("评估完成")
