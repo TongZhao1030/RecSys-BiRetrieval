@@ -2,6 +2,11 @@
 
 基于双塔对比学习的蛋白质-分子双向检索系统。
 
+## 作者
+
+- **赵桐** - [https://github.com/TongZhao1030](https://github.com/TongZhao1030)
+- **杜伊诺** - [https://github.com/DDDeno](https://github.com/DDDeno)
+
 ## 简介
 
 本项目实现了一个**双向检索系统**，支持：
@@ -99,6 +104,12 @@ python app.py
 - 蛋白质序列 → 分子检索
 - SMILES → 蛋白质检索
 - 单对相似度计算
+
+## 演示视频
+
+系统使用演示视频：[final_video_UI.mp4](final_video_UI.mp4)
+
+该视频展示了完整的用户界面操作流程，包括双向检索功能和相似度计算功能的使用方法。
 
 ## 项目结构
 
