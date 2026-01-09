@@ -1,257 +1,385 @@
 """
-双向检索评估脚本
+蛋白质-分子相似度热力图
+
+正确的评估逻辑：
+1. 选择 N 个蛋白质和 N 个分子（可以不是一一对应的配对）
+2. 构建正样本矩阵（标记哪些 (i,j) 是已知的高亲和力配对）
+3. 计算相似度矩阵
+4. 评估：正样本位置的分数是否显著高于负样本位置
+5. 热力图可视化
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import math
+from collections import defaultdict
 from transformers import AutoModel, AutoTokenizer
 from datasets import load_from_disk
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
-import seaborn as sns 
-import numpy as np
+import seaborn as sns
 
+# ============================================================================
 # 配置
+# ============================================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-PATH_MODEL = "dual_tower_final.pth"
+PATH_MODEL = "./outputs/model_best.pth"
 PATH_SAPROT = "./models/SaProt_650M_AF2"
 PATH_CHEMBERTA = "./models/ChemBERTa-zinc-base-v1"
-PATH_DATA = "./data/bindingdb_local"
-TEST_SIZE = 100 
+PATH_DATA_TEST = "./data/vladak_bindingdb/test"
 
-print(f"Device: {DEVICE}")
+# 热力图配置
+N_SAMPLES = 50  # 热力图大小 (N x N)
+POSITIVE_THRESHOLD = 7.0  # 与训练配置一致
 
+print(f"设备: {DEVICE}")
+
+# ============================================================================
+# 模型定义（与训练一致）
+# ============================================================================
 class DualTowerModel(nn.Module):
-    def __init__(self):
+    def __init__(self, path_saprot, path_chemberta):
         super().__init__()
-        self.prot_model = AutoModel.from_pretrained(PATH_SAPROT, trust_remote_code=True)
-        self.mol_model = AutoModel.from_pretrained(PATH_CHEMBERTA)
+        self.prot_model = AutoModel.from_pretrained(path_saprot, trust_remote_code=True)
+        self.mol_model = AutoModel.from_pretrained(path_chemberta)
         
         prot_hidden = self.prot_model.config.hidden_size
         mol_hidden = 768
-        hidden_dim = 1024
+        hidden_dim = 1024  # 与训练一致
         embedding_dim = 256
-
-        self.prot_layernorm = nn.LayerNorm(prot_hidden)
-        self.mol_layernorm = nn.LayerNorm(mol_hidden)
-
+        
+        # 4层投影网络（与训练一致）
         self.prot_proj = nn.Sequential(
             nn.Linear(prot_hidden, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, embedding_dim)
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.LayerNorm(hidden_dim//2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim//2, embedding_dim)
         )
         
         self.mol_proj = nn.Sequential(
             nn.Linear(mol_hidden, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, embedding_dim)
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.LayerNorm(hidden_dim//2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim//2, embedding_dim)
         )
         
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.log_temperature = nn.Parameter(torch.tensor(math.log(0.07)))
+    
+    def encode_protein(self, input_ids, attention_mask):
+        outputs = self.prot_model(input_ids=input_ids, attention_mask=attention_mask)
+        mask = attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
+        embeddings = torch.sum(outputs.last_hidden_state * mask, dim=1) / torch.clamp(mask.sum(1), min=1e-9)
+        embeddings = self.prot_proj(embeddings)
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        return embeddings
+    
+    def encode_molecule(self, input_ids, attention_mask):
+        outputs = self.mol_model(input_ids=input_ids, attention_mask=attention_mask)
+        mask = attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
+        embeddings = torch.sum(outputs.last_hidden_state * mask, dim=1) / torch.clamp(mask.sum(1), min=1e-9)
+        embeddings = self.mol_proj(embeddings)
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        return embeddings
+    
+    def get_temperature(self):
+        return self.log_temperature.exp()
 
-    def forward(self, prot_input_ids, prot_attention_mask, mol_input_ids, mol_attention_mask):
-        prot_out = self.prot_model(input_ids=prot_input_ids, attention_mask=prot_attention_mask)
-        mask = prot_attention_mask.unsqueeze(-1).expand(prot_out.last_hidden_state.size()).float()
-        prot_emb = torch.sum(prot_out.last_hidden_state * mask, dim=1) / torch.clamp(mask.sum(1), min=1e-9)
-        prot_emb = self.prot_layernorm(prot_emb)
-        prot_vec = self.prot_proj(prot_emb)
-
-        mol_out = self.mol_model(input_ids=mol_input_ids, attention_mask=mol_attention_mask)
-        mol_mask = mol_attention_mask.unsqueeze(-1).expand(mol_out.last_hidden_state.size()).float()
-        mol_emb = torch.sum(mol_out.last_hidden_state * mol_mask, dim=1) / torch.clamp(mol_mask.sum(1), min=1e-9)
-        mol_emb = self.mol_layernorm(mol_emb)
-        mol_vec = self.mol_proj(mol_emb)
-
-        prot_vec = F.normalize(prot_vec, p=2, dim=1)
-        mol_vec = F.normalize(mol_vec, p=2, dim=1)
+# ============================================================================
+# 数据构建
+# ============================================================================
+def build_heatmap_data(dataset, n_samples=N_SAMPLES):
+    """
+    构建热力图数据
+    
+    策略：
+    1. 收集所有正样本配对
+    2. 选择 N 个蛋白质和 N 个分子
+    3. 构建正样本矩阵（标记哪些 (i,j) 是正样本）
+    
+    Returns:
+        proteins: N 个蛋白质
+        molecules: N 个分子
+        positive_matrix: N x N 的 0/1 矩阵，表示正样本位置
+    """
+    print("构建热力图数据...")
+    
+    # 收集所有正样本配对
+    positive_pairs = set()  # (prot, mol)
+    prot_to_mols = defaultdict(set)
+    mol_to_prots = defaultdict(set)
+    
+    for idx in range(len(dataset)):
+        item = dataset[idx]
+        pic50 = item['ic50']
         
-        return prot_vec, mol_vec, self.logit_scale.exp()
+        if pic50 is None or math.isnan(pic50) or math.isinf(pic50):
+            continue
+        if pic50 < POSITIVE_THRESHOLD:
+            continue
+        
+        prot = item['protein']
+        mol = item['ligand']
+        
+        positive_pairs.add((prot, mol))
+        prot_to_mols[prot].add(mol)
+        mol_to_prots[mol].add(prot)
+    
+    print(f"正样本配对数: {len(positive_pairs)}")
+    print(f"有正样本的蛋白质数: {len(prot_to_mols)}")
+    print(f"有正样本的分子数: {len(mol_to_prots)}")
+    
+    # 选择蛋白质：优先选择有多个正样本分子的
+    sorted_prots = sorted(prot_to_mols.keys(), key=lambda p: -len(prot_to_mols[p]))
+    proteins = sorted_prots[:n_samples]
+    
+    # 选择分子：优先选择与已选蛋白质有配对关系的
+    selected_mols = set()
+    for prot in proteins:
+        selected_mols.update(prot_to_mols[prot])
+    
+    # 按配对数排序
+    sorted_mols = sorted(selected_mols, key=lambda m: -len(mol_to_prots[m]))
+    molecules = sorted_mols[:n_samples]
+    
+    # 如果不够，补充其他分子
+    if len(molecules) < n_samples:
+        other_mols = [m for m in mol_to_prots.keys() if m not in selected_mols]
+        molecules.extend(other_mols[:n_samples - len(molecules)])
+    
+    print(f"\n选择的蛋白质数: {len(proteins)}")
+    print(f"选择的分子数: {len(molecules)}")
+    
+    # 构建正样本矩阵
+    prot_to_idx = {p: i for i, p in enumerate(proteins)}
+    mol_to_idx = {m: i for i, m in enumerate(molecules)}
+    
+    positive_matrix = np.zeros((len(proteins), len(molecules)), dtype=np.int32)
+    n_positives = 0
+    
+    for prot, mol in positive_pairs:
+        if prot in prot_to_idx and mol in mol_to_idx:
+            i = prot_to_idx[prot]
+            j = mol_to_idx[mol]
+            positive_matrix[i, j] = 1
+            n_positives += 1
+    
+    print(f"热力图中的正样本数: {n_positives} / {len(proteins) * len(molecules)} ({n_positives / (len(proteins) * len(molecules)) * 100:.2f}%)")
+    
+    return proteins, molecules, positive_matrix
 
-# 加载模型
-print("加载模型...")
-model = DualTowerModel().to(DEVICE)
-try:
-    state_dict = torch.load(PATH_MODEL, map_location=DEVICE, weights_only=False)
+# ============================================================================
+# 主函数
+# ============================================================================
+def main():
+    # 加载模型
+    print("\n加载模型...")
+    model = DualTowerModel(PATH_SAPROT, PATH_CHEMBERTA).to(DEVICE)
+    
+    checkpoint = torch.load(PATH_MODEL, map_location=DEVICE, weights_only=False)
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+    
     new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(new_state_dict)
     model.eval()
-    print(f"模型加载成功, Temperature: {model.logit_scale.exp().item():.2f}")
-except Exception as e:
-    print(f"模型加载失败: {e}")
-    exit()
-
-# 准备测试数据
-mol_tokenizer = AutoTokenizer.from_pretrained(PATH_CHEMBERTA)
-prot_tokenizer = AutoTokenizer.from_pretrained(PATH_SAPROT, trust_remote_code=True)
-dataset = load_from_disk(PATH_DATA)
-
-# 构建全局映射
-from collections import defaultdict
-prot_to_mols = defaultdict(set)
-mol_to_prots = defaultdict(set)
-for idx in range(len(dataset)):
-    prot = dataset[idx]['Protein Sequence']
-    mol = dataset[idx]['Molecule Sequence']
-    prot_to_mols[prot].add(mol)
-    mol_to_prots[mol].add(prot)
-
-# 选择唯一配对数据
-seen_prots = set()
-seen_mols = set()
-test_pairs = []
-for idx in range(len(dataset)):
-    prot = dataset[idx]['Protein Sequence']
-    mol = dataset[idx]['Molecule Sequence']
-    if prot not in seen_prots and mol not in seen_mols:
-        seen_prots.add(prot)
-        seen_mols.add(mol)
-        test_pairs.append((prot, mol))
-    if len(test_pairs) >= TEST_SIZE:
-        break
-
-prots = [p for p, m in test_pairs]
-mols = [m for p, m in test_pairs]
-prots_set = set(prots)
-mols_set = set(mols)
-print(f"测试样本: {len(test_pairs)} 对")
-
-def encode_batch(p_list, m_list):
-    p_fmt = [" ".join([aa + "#" for aa in seq]) for seq in p_list]
     
-    p_in = prot_tokenizer(p_fmt, return_tensors="pt", padding=True, truncation=True, max_length=512).to(DEVICE)
-    m_in = mol_tokenizer(m_list, return_tensors="pt", padding=True, truncation=True, max_length=128).to(DEVICE)
+    temp = model.get_temperature().item()
+    print(f"模型加载成功，温度: {temp:.4f}")
     
-    with torch.no_grad():
-        pv, mv, _ = model(
-            p_in['input_ids'], p_in['attention_mask'],
-            m_in['input_ids'], m_in['attention_mask']
-        )
-    return pv, mv
-
-print("计算向量...")
-db_prot_vecs = []
-db_mol_vecs = []
-
-BATCH = 32
-for i in range(0, TEST_SIZE, BATCH):
-    p_batch = prots[i:i+BATCH]
-    m_batch = mols[i:i+BATCH]
-    pv, mv = encode_batch(p_batch, m_batch)
-    db_prot_vecs.append(pv)
-    db_mol_vecs.append(mv)
-
-prot_vecs = torch.cat(db_prot_vecs, dim=0)
-mol_vecs = torch.cat(db_mol_vecs, dim=0)
-
-sim_matrix = torch.matmul(prot_vecs, mol_vecs.T).cpu().numpy()
-
-print("\n=== 双向检索评估 ===")
-
-def compute_metrics(sim_matrix, direction="P→M"):
-    n = sim_matrix.shape[0]
-    top1_hits = 0
-    top5_hits = 0
-    top10_hits = 0
-    ranks = []
-    valid_queries = 0
+    # 加载 tokenizer
+    mol_tokenizer = AutoTokenizer.from_pretrained(PATH_CHEMBERTA)
+    prot_tokenizer = AutoTokenizer.from_pretrained(PATH_SAPROT, trust_remote_code=True)
     
-    for i in range(n):
-        if direction == "P→M":
-            scores = sim_matrix[i]
-            gt_set = prot_to_mols[prots[i]] & mols_set
-        else:
-            scores = sim_matrix.T[i]
-            gt_set = mol_to_prots[mols[i]] & prots_set
+    # 加载数据并构建热力图数据
+    print("\n加载数据...")
+    test_dataset = load_from_disk(PATH_DATA_TEST)
+    proteins, molecules, positive_matrix = build_heatmap_data(test_dataset, N_SAMPLES)
+    
+    n_prots = len(proteins)
+    n_mols = len(molecules)
+    
+    # 编码
+    print("\n编码蛋白质和分子...")
+    
+    def encode_proteins_batch(prot_list, batch_size=8):
+        all_vecs = []
+        for i in range(0, len(prot_list), batch_size):
+            batch = prot_list[i:i+batch_size]
+            formatted = [" ".join([aa + "#" for aa in seq]) for seq in batch]
+            inputs = prot_tokenizer(formatted, return_tensors="pt", padding=True,
+                                    truncation=True, max_length=512).to(DEVICE)
+            with torch.no_grad():
+                vecs = model.encode_protein(inputs['input_ids'], inputs['attention_mask'])
+            all_vecs.append(vecs)
+        return torch.cat(all_vecs, dim=0)
+    
+    def encode_molecules_batch(mol_list, batch_size=16):
+        all_vecs = []
+        for i in range(0, len(mol_list), batch_size):
+            batch = mol_list[i:i+batch_size]
+            inputs = mol_tokenizer(batch, return_tensors="pt", padding=True,
+                                   truncation=True, max_length=128).to(DEVICE)
+            with torch.no_grad():
+                vecs = model.encode_molecule(inputs['input_ids'], inputs['attention_mask'])
+            all_vecs.append(vecs)
+        return torch.cat(all_vecs, dim=0)
+    
+    prot_vecs = encode_proteins_batch(proteins)
+    mol_vecs = encode_molecules_batch(molecules)
+    
+    # 计算相似度矩阵
+    sim_matrix = torch.matmul(prot_vecs, mol_vecs.T).cpu().numpy()
+    
+    # ========================================================================
+    # 评估
+    # ========================================================================
+    print("\n" + "=" * 60)
+    print("评估结果")
+    print("=" * 60)
+    
+    # 正样本 vs 负样本分数
+    positive_mask = positive_matrix > 0
+    negative_mask = ~positive_mask
+    
+    pos_scores = sim_matrix[positive_mask]
+    neg_scores = sim_matrix[negative_mask]
+    
+    if len(pos_scores) > 0:
+        print(f"\n正样本分数: {pos_scores.mean():.4f} ± {pos_scores.std():.4f} (n={len(pos_scores)})")
+        print(f"负样本分数: {neg_scores.mean():.4f} ± {neg_scores.std():.4f} (n={len(neg_scores)})")
+        print(f"Margin: {pos_scores.mean() - neg_scores.mean():.4f}")
+    else:
+        print("警告: 热力图中没有正样本！")
+    
+    # P2M Recall@K: 每个蛋白质的 top-k 预测中是否命中正样本
+    print(f"\nP→M 检索评估 (在 {n_mols} 个分子中检索):")
+    for k in [1, 5, 10]:
+        recall = 0
+        n_queries = 0
+        for i in range(n_prots):
+            if positive_matrix[i].sum() > 0:  # 该蛋白质有正样本
+                n_queries += 1
+                top_k_indices = np.argsort(sim_matrix[i])[::-1][:k]
+                if any(positive_matrix[i, j] > 0 for j in top_k_indices):
+                    recall += 1
+        if n_queries > 0:
+            print(f"  Recall@{k}: {recall/n_queries*100:.1f}% ({recall}/{n_queries})")
+    
+    # M2P Recall@K
+    print(f"\nM→P 检索评估 (在 {n_prots} 个蛋白质中检索):")
+    for k in [1, 5, 10]:
+        recall = 0
+        n_queries = 0
+        for j in range(n_mols):
+            if positive_matrix[:, j].sum() > 0:  # 该分子有正样本
+                n_queries += 1
+                top_k_indices = np.argsort(sim_matrix[:, j])[::-1][:k]
+                if any(positive_matrix[i, j] > 0 for i in top_k_indices):
+                    recall += 1
+        if n_queries > 0:
+            print(f"  Recall@{k}: {recall/n_queries*100:.1f}% ({recall}/{n_queries})")
+    
+    # ========================================================================
+    # 绘制热力图
+    # ========================================================================
+    print("\n绘制热力图...")
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    
+    # 左图：相似度热力图
+    ax1 = axes[0]
+    im1 = ax1.imshow(sim_matrix, cmap="viridis", aspect='auto')
+    ax1.set_title(f"Similarity Matrix (N={n_prots}×{n_mols})\n"
+                  f"Positive: {pos_scores.mean():.3f} | Negative: {neg_scores.mean():.3f}",
+                  fontsize=11)
+    ax1.set_xlabel("Molecule Index", fontsize=10)
+    ax1.set_ylabel("Protein Index", fontsize=10)
+    plt.colorbar(im1, ax=ax1, label='Similarity Score')
+    
+    # 标记正样本位置（用红色小点）
+    pos_i, pos_j = np.where(positive_matrix > 0)
+    ax1.scatter(pos_j, pos_i, c='red', s=5, alpha=0.7, marker='s', label='Positive pairs')
+    ax1.legend(loc='upper right', fontsize=8)
+    
+    # 右图：正样本矩阵（Ground Truth）
+    ax2 = axes[1]
+    im2 = ax2.imshow(positive_matrix, cmap="Reds", aspect='auto')
+    ax2.set_title(f"Ground Truth Positive Pairs\n"
+                  f"{positive_matrix.sum()} positives ({positive_matrix.sum()/(n_prots*n_mols)*100:.1f}%)",
+                  fontsize=11)
+    ax2.set_xlabel("Molecule Index", fontsize=10)
+    ax2.set_ylabel("Protein Index", fontsize=10)
+    plt.colorbar(im2, ax=ax2, label='Is Positive')
+    
+    plt.tight_layout()
+    plt.savefig("diagnosis_heatmap.png", dpi=150)
+    print(f"\n热力图已保存: diagnosis_heatmap.png")
+    
+    # ========================================================================
+    # 绘制分数分布直方图
+    # ========================================================================
+    if len(pos_scores) > 0:
+        fig2, ax = plt.subplots(figsize=(8, 5))
         
-        if len(gt_set) == 0:
-            continue
-        valid_queries += 1
+        ax.hist(neg_scores, bins=50, alpha=0.6, label=f'Negative (n={len(neg_scores)})', color='blue')
+        ax.hist(pos_scores, bins=50, alpha=0.6, label=f'Positive (n={len(pos_scores)})', color='red')
+        ax.axvline(x=pos_scores.mean(), color='red', linestyle='--', linewidth=2, label=f'Pos mean: {pos_scores.mean():.3f}')
+        ax.axvline(x=neg_scores.mean(), color='blue', linestyle='--', linewidth=2, label=f'Neg mean: {neg_scores.mean():.3f}')
         
-        sorted_indices = np.argsort(scores)[::-1]
-        target_list = mols if direction == "P→M" else prots
-        first_hit_rank = None
-        for rank, idx in enumerate(sorted_indices):
-            if target_list[idx] in gt_set:
-                if first_hit_rank is None:
-                    first_hit_rank = rank
-                break
+        ax.set_xlabel('Similarity Score', fontsize=11)
+        ax.set_ylabel('Count', fontsize=11)
+        ax.set_title('Score Distribution: Positive vs Negative Pairs', fontsize=12)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
         
-        if first_hit_rank is not None:
-            ranks.append(first_hit_rank)
-            if first_hit_rank == 0:
-                top1_hits += 1
-            if first_hit_rank < 5:
-                top5_hits += 1
-            if first_hit_rank < 10:
-                top10_hits += 1
+        plt.tight_layout()
+        plt.savefig("score_distribution.png", dpi=150)
+        print(f"分数分布图已保存: score_distribution.png")
     
-    return {
-        'top1': top1_hits / valid_queries * 100 if valid_queries > 0 else 0,
-        'top5': top5_hits / valid_queries * 100 if valid_queries > 0 else 0,
-        'top10': top10_hits / valid_queries * 100 if valid_queries > 0 else 0,
-        'mean_rank': np.mean(ranks) if ranks else 0,
-        'mrr': np.mean([1.0 / (r + 1) for r in ranks]) if ranks else 0,
-        'valid_queries': valid_queries
-    }
+    # ========================================================================
+    # 诊断信息
+    # ========================================================================
+    print("\n" + "=" * 60)
+    print("诊断信息")
+    print("=" * 60)
+    
+    # 找出分数最高的正样本和负样本
+    if len(pos_scores) > 0:
+        best_pos_idx = np.unravel_index(np.argmax(sim_matrix * positive_matrix), sim_matrix.shape)
+        worst_pos_idx = np.unravel_index(np.argmin(sim_matrix + (1 - positive_matrix) * 10), sim_matrix.shape)
+        
+        print(f"\n最高正样本分数: {sim_matrix[best_pos_idx]:.4f} at ({best_pos_idx[0]}, {best_pos_idx[1]})")
+        print(f"最低正样本分数: {sim_matrix[worst_pos_idx]:.4f} at ({worst_pos_idx[0]}, {worst_pos_idx[1]})")
+    
+    # 找出分数最高的负样本（错误的高分）
+    neg_sim = sim_matrix * (1 - positive_matrix)
+    best_neg_idx = np.unravel_index(np.argmax(neg_sim), sim_matrix.shape)
+    print(f"最高负样本分数: {sim_matrix[best_neg_idx]:.4f} at ({best_neg_idx[0]}, {best_neg_idx[1]})")
+    
+    print("\n" + "=" * 60)
+    print("完成")
+    print("=" * 60)
 
-# Protein → Molecule
-p2m = compute_metrics(sim_matrix, "P→M")
-print(f"\nProtein → Molecule (有效查询: {p2m['valid_queries']})")
-print(f"   Top-1: {p2m['top1']:.1f}%  Top-5: {p2m['top5']:.1f}%  Top-10: {p2m['top10']:.1f}%")
-print(f"   Mean Rank: {p2m['mean_rank']:.2f}  MRR: {p2m['mrr']:.4f}")
-
-# Molecule → Protein
-m2p = compute_metrics(sim_matrix, "M→P")
-print(f"\nMolecule → Protein (有效查询: {m2p['valid_queries']})")
-print(f"   Top-1: {m2p['top1']:.1f}%  Top-5: {m2p['top5']:.1f}%  Top-10: {m2p['top10']:.1f}%")
-print(f"   Mean Rank: {m2p['mean_rank']:.2f}  MRR: {m2p['mrr']:.4f}")
-
-# 平均
-print(f"\n平均: Top-1 {(p2m['top1'] + m2p['top1']) / 2:.1f}%  MRR {(p2m['mrr'] + m2p['mrr']) / 2:.4f}")
-
-# 区分度分析
-diag_scores = np.diag(sim_matrix)
-mask = ~np.eye(TEST_SIZE, dtype=bool)
-off_diag_scores = sim_matrix[mask]
-margin = diag_scores.mean() - off_diag_scores.mean()
-
-print(f"\n区分度: 正样本 {diag_scores.mean():.4f} / 负样本 {off_diag_scores.mean():.4f} / Margin {margin:.4f}")
-
-# 生成热力图
-fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-# 完整热力图
-ax1 = axes[0]
-sns.heatmap(sim_matrix, cmap="viridis", center=0, ax=ax1)
-ax1.set_title(f"Similarity Matrix (N={TEST_SIZE})\nP→M: {p2m['top1']:.1f}% | M→P: {m2p['top1']:.1f}%")
-ax1.set_xlabel("Molecule Index")
-ax1.set_ylabel("Protein Index")
-
-# 局部放大 (前20个)
-ax2 = axes[1]
-sub_size = min(20, TEST_SIZE)
-sub_matrix = sim_matrix[:sub_size, :sub_size]
-sns.heatmap(sub_matrix, cmap="viridis", center=0, ax=ax2, annot=True, fmt=".2f", annot_kws={"size": 6})
-ax2.set_title(f"Zoomed View")
-ax2.set_xlabel("Molecule Index")
-ax2.set_ylabel("Protein Index")
-
-plt.tight_layout()
-plt.savefig("diagnosis_heatmap.png", dpi=150)
-print(f"\n热力图已保存: diagnosis_heatmap.png")
-
-# 不对称性检查
-asymmetry = abs(p2m['top1'] - m2p['top1'])
-if asymmetry > 20:
-    weaker = "P→M" if p2m['top1'] < m2p['top1'] else "M→P"
-    print(f"\n注意: 双向不对称 {asymmetry:.1f}%, {weaker} 较弱")
-
-print("\n评估完成")
+if __name__ == "__main__":
+    main()

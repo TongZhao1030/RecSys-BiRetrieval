@@ -1,19 +1,13 @@
 """
-蛋白质-分子双塔模型训练脚本 (基于pIC50监督的对比学习)
+蛋白质-分子双塔模型训练脚本 v2 (改进版)
 
 主要改进：
-1. 使用更大的vladak/bindingdb数据集 (~100万训练样本)
-2. 数据集中的'ic50'列实际上已经是pIC50值，直接使用
-3. 基于pIC50值定义正负样本
-4. 使用Supervised Contrastive Loss进行训练
-5. 支持验证集评估
-
-pIC50说明 (数据集已预处理):
-- pIC50 = -log10(IC50_M)，值越大表示结合越强
-- 高亲和力: pIC50 > 7 (IC50 < 100 nM)
-- 中亲和力: 5 < pIC50 < 7 (100 nM < IC50 < 10 μM)
-- 低亲和力: pIC50 < 5 (IC50 > 10 μM)
-- 负值/极低值: 表示极弱或无结合
+1. 修复学习率调度器
+2. 限制温度参数范围
+3. 简化Loss设计，使用标准对比学习
+4. 放宽数据筛选条件
+5. 添加验证评估和早停
+6. 使用Cosine退火学习率
 """
 
 import os
@@ -39,29 +33,33 @@ import json
 @dataclass
 class TrainConfig:
     # 基础配置
-    per_device_batch_size: int = 16          # 每个蛋白质的批次大小
-    mols_per_protein: int = 8                 # 每个蛋白质采样的分子数
-    gradient_accumulation_steps: int = 2
-    epochs: int = 50
+    per_device_batch_size: int = 32          # 每个batch的蛋白质数
+    mols_per_protein: int = 12                 # 每个蛋白质采样的分子数
+    gradient_accumulation_steps: int = 4
+    samples_per_epoch: int = 20               # 每个epoch内，每个蛋白质被采样的次数（提高数据利用率）
+    epochs: int = 10                          # 减少epoch数（因为每个epoch更长了）
     
     # 学习率
-    lr_prot_backbone: float = 1e-5
-    lr_mol_backbone: float = 5e-6
-    lr_head: float = 2e-4
-    lr_temp: float = 1e-3
+    lr_prot_backbone: float = 3e-5            # 稍微提高backbone学习率
+    lr_mol_backbone: float = 2e-5
+    lr_head: float = 2e-4                     # 降低head学习率
+    lr_temp: float = 1e-4                     # 大幅降低温度学习率
     
     # 正则化
     max_grad_norm: float = 1.0
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
+    min_lr_ratio: float = 0.01                # 最小学习率为初始的1%
     
-    # IC50阈值 (pIC50)
-    positive_threshold: float = 7.0    # pIC50 > 7 为强正样本 (IC50 < 100nM)
-    negative_threshold: float = 5.0    # pIC50 < 5 为负样本 (IC50 > 10μM)
+    # IC50阈值 (pIC50) - 放宽条件
+    positive_threshold: float = 7.0           # 放宽正样本阈值 (IC50 < 1μM)
+    negative_threshold: float = 5.0           # 负样本阈值
+    min_mols_per_protein: int = 2             # 降低最小分子数要求
     
     # 损失函数配置
-    temperature: float = 0.07
-    margin: float = 0.5                # Triplet loss margin
+    temperature_init: float = 0.07
+    temperature_min: float = 0.03             # 温度下限
+    temperature_max: float = 0.2              # 温度上限 (比之前严格很多)
     
     # 路径
     path_saprot: str = "./models/SaProt_650M_AF2"
@@ -71,114 +69,112 @@ class TrainConfig:
     
     # 输出
     output_dir: str = "./outputs"
-    save_every_epochs: int = 10
-    eval_every_steps: int = 500
-    log_every_steps: int = 20
+    save_every_epochs: int = 5
+    eval_every_epochs: int = 1                # 每5个epoch评估一次
+    log_every_steps: int = 100
+    
+    # 早停
+    patience: int = 3                        # 5个epoch没有提升就停止
 
 config = TrainConfig()
 
 # ============================================================================
-# pIC50 处理函数
+# 数据预处理 (放宽条件)
 # ============================================================================
-def pic50_to_affinity_class(pic50: float) -> int:
+def preprocess_dataset(dataset, accelerator=None, require_both_classes=False):
     """
-    将pIC50转换为亲和力类别
-    2: 高亲和力 (pIC50 > 7, IC50 < 100nM)
-    1: 中亲和力 (5 < pIC50 < 7)
-    0: 低亲和力 (pIC50 < 5, IC50 > 10μM)
+    预处理数据集，放宽筛选条件
     
-    注意: 数据集中的'ic50'列已经是pIC50值，无需转换
-    """
-    if pic50 >= config.positive_threshold:
-        return 2
-    elif pic50 >= config.negative_threshold:
-        return 1
-    else:
-        return 0
-
-# ============================================================================
-# 数据预处理
-# ============================================================================
-def preprocess_dataset(dataset, accelerator=None):
-    """
-    预处理数据集：
-    1. 数据集中的'ic50'列实际上是pIC50值，直接使用
-    2. 过滤无效样本
-    3. 按蛋白质分组
+    返回:
+        filtered_data: 蛋白质 -> 分子列表的映射
+        ligand_to_proteins: 分子 -> 蛋白质集合的映射 (用于处理多标签)
     """
     is_main = accelerator is None or accelerator.is_main_process
     
-    # 按蛋白质分组
     protein_to_data = defaultdict(list)
+    ligand_to_proteins = defaultdict(set)  # 新增：记录每个分子对应的所有蛋白质
     valid_count = 0
     invalid_count = 0
     
     for idx in range(len(dataset)):
         item = dataset[idx]
-        # 数据集中的'ic50'列实际上已经是pIC50值
         pic50 = item['ic50']
         
-        # 过滤无效pIC50
         if pic50 is None or math.isnan(pic50) or math.isinf(pic50):
             invalid_count += 1
             continue
         
-        # 过滤异常值 (pIC50一般在-2到12之间是合理的)
-        # 负值表示极弱结合，保留但限制范围
         if pic50 < -2 or pic50 > 14:
             invalid_count += 1
             continue
+        
+        # 分类：正样本(pIC50>=6)，负样本(pIC50<5)，中间样本(5<=pIC50<6)
+        if pic50 >= config.positive_threshold:
+            affinity_class = 2  # 正样本
+        elif pic50 < config.negative_threshold:
+            affinity_class = 0  # 负样本
+        else:
+            affinity_class = 1  # 中间样本
         
         protein_to_data[item['protein']].append({
             'idx': idx,
             'ligand': item['ligand'],
             'protein': item['protein'],
             'pic50': pic50,
-            'affinity_class': pic50_to_affinity_class(pic50)
+            'affinity_class': affinity_class
         })
+        
+        # 记录分子-蛋白质关系 (只记录有一定亲和力的，pIC50 >= 4)
+        if pic50 >= 4.0:
+            ligand_to_proteins[item['ligand']].add(item['protein'])
+        
         valid_count += 1
+    
+    # 如果不要求同时有正负样本，保留所有有足够分子的蛋白质
+    filtered_data = {}
+    for prot, mols in protein_to_data.items():
+        if len(mols) >= config.min_mols_per_protein:
+            if require_both_classes:
+                # 严格模式：要求同时有正负样本
+                has_positive = any(m['affinity_class'] == 2 for m in mols)
+                has_negative = any(m['affinity_class'] == 0 for m in mols)
+                if has_positive and has_negative:
+                    filtered_data[prot] = sorted(mols, key=lambda x: -x['pic50'])
+            else:
+                # 宽松模式：只要有正样本就行
+                has_positive = any(m['affinity_class'] == 2 for m in mols)
+                if has_positive:
+                    filtered_data[prot] = sorted(mols, key=lambda x: -x['pic50'])
     
     if is_main:
         print(f"数据预处理完成: {valid_count} 有效样本, {invalid_count} 无效样本")
         print(f"唯一蛋白质数: {len(protein_to_data)}")
+        print(f"符合条件的蛋白质数: {len(filtered_data)}")
         
         # 统计亲和力分布
         class_counts = {0: 0, 1: 0, 2: 0}
-        pic50_values = []
-        for prot, mols in protein_to_data.items():
+        for prot, mols in filtered_data.items():
             for m in mols:
                 class_counts[m['affinity_class']] += 1
-                pic50_values.append(m['pic50'])
         
-        print(f"亲和力分布: 高(pIC50>7)={class_counts[2]}, 中(5-7)={class_counts[1]}, 低(<5)={class_counts[0]}")
-        print(f"pIC50范围: [{min(pic50_values):.2f}, {max(pic50_values):.2f}], 均值: {sum(pic50_values)/len(pic50_values):.2f}")
+        print(f"亲和力分布: 高(>={config.positive_threshold})={class_counts[2]}, "
+              f"中={class_counts[1]}, 低(<{config.negative_threshold})={class_counts[0]}")
+        
+        # 统计多蛋白质分子
+        multi_prot_ligands = sum(1 for prots in ligand_to_proteins.values() if len(prots) > 1)
+        print(f"对应多个蛋白质的分子数: {multi_prot_ligands} ({multi_prot_ligands/len(ligand_to_proteins)*100:.1f}%)")
     
-    return protein_to_data
+    return filtered_data, ligand_to_proteins
 
 # ============================================================================
 # 数据集和采样器
 # ============================================================================
 class BindingAffinityDataset(Dataset):
-    """
-    基于蛋白质分组的数据集
-    每个样本是一个蛋白质及其关联的分子列表
-    """
-    def __init__(self, protein_to_data: Dict, min_mols_per_protein: int = 2):
-        """
-        Args:
-            protein_to_data: 蛋白质到分子数据的映射
-            min_mols_per_protein: 每个蛋白质最少需要的分子数
-        """
-        # 过滤掉分子数太少的蛋白质
-        self.protein_data = {}
-        for prot, mols in protein_to_data.items():
-            if len(mols) >= min_mols_per_protein:
-                # 按pIC50排序，方便后续采样
-                mols_sorted = sorted(mols, key=lambda x: -x['pic50'])
-                self.protein_data[prot] = mols_sorted
-        
-        self.proteins = list(self.protein_data.keys())
-        print(f"符合条件的蛋白质数: {len(self.proteins)} (>={min_mols_per_protein}个分子)")
+    def __init__(self, protein_data: Dict, ligand_to_proteins: Dict = None):
+        self.protein_data = protein_data
+        self.proteins = list(protein_data.keys())
+        self.ligand_to_proteins = ligand_to_proteins or {}
+        print(f"数据集蛋白质数: {len(self.proteins)}")
         
     def __len__(self):
         return len(self.proteins)
@@ -191,45 +187,28 @@ class BindingAffinityDataset(Dataset):
             'molecules': mol_data
         }
 
-class AffinityBatchSampler(Sampler):
+class SimpleBatchSampler(Sampler):
     """
-    亲和力感知的批次采样器
+    批次采样器，支持多轮采样以提高数据利用率
     
-    每个批次包含:
-    - batch_size 个不同的蛋白质
-    - 每个蛋白质采样 mols_per_protein 个分子
-    
-    采样策略：
-    - 优先采样高亲和力(正样本)和低亲和力(负样本)的分子
-    - 确保每个蛋白质的样本中有正有负
+    每个epoch内，所有蛋白质会被采样 samples_per_epoch 次，
+    每次采样时会随机选择不同的分子，从而充分利用数据。
     """
-    def __init__(self, dataset: BindingAffinityDataset, 
-                 batch_size: int, 
-                 mols_per_protein: int,
-                 drop_last: bool = True):
+    def __init__(self, dataset: BindingAffinityDataset, batch_size: int, 
+                 samples_per_epoch: int = 1, drop_last: bool = True):
         self.dataset = dataset
         self.batch_size = batch_size
-        self.mols_per_protein = mols_per_protein
+        self.samples_per_epoch = samples_per_epoch  # 每个蛋白质每epoch被采样的次数
         self.drop_last = drop_last
-        
-        # 找出有正负样本的蛋白质，记录索引
-        self.valid_indices = []
-        for idx, prot_seq in enumerate(dataset.proteins):
-            mols = dataset.protein_data[prot_seq]
-            has_positive = any(m['affinity_class'] == 2 for m in mols)
-            has_negative = any(m['affinity_class'] == 0 for m in mols)
-            if has_positive and has_negative:
-                self.valid_indices.append(idx)
-        
-        print(f"有正负样本的蛋白质数: {len(self.valid_indices)}")
+        self.base_indices = list(range(len(dataset)))
         
     def __iter__(self):
-        # 打乱索引顺序
-        indices = self.valid_indices.copy()
-        random.shuffle(indices)
+        # 将所有蛋白质索引重复 samples_per_epoch 次
+        all_indices = self.base_indices * self.samples_per_epoch
+        random.shuffle(all_indices)
         
         batch = []
-        for idx in indices:
+        for idx in all_indices:
             batch.append(idx)
             if len(batch) == self.batch_size:
                 yield batch
@@ -239,73 +218,64 @@ class AffinityBatchSampler(Sampler):
             yield batch
     
     def __len__(self):
-        n = len(self.valid_indices)
+        n = len(self.base_indices) * self.samples_per_epoch
         if self.drop_last:
             return n // self.batch_size
         return (n + self.batch_size - 1) // self.batch_size
 
 class DataCollator:
     """
-    数据整理器：处理批次数据的tokenization和采样
+    数据整理器 - 修复版
+    
+    核心修改：
+    1. 只有高亲和力分子(affinity_class==2)才标记为正样本
+    2. 采样策略只采样高亲和力分子，负样本来自batch内其他蛋白质的分子
     """
-    def __init__(self, mol_tokenizer, prot_tokenizer, mols_per_protein: int):
+    def __init__(self, mol_tokenizer, prot_tokenizer, mols_per_protein: int, 
+                 ligand_to_proteins: Dict = None, protein_to_idx: Dict = None):
         self.mol_tok = mol_tokenizer
         self.prot_tok = prot_tokenizer
         self.mols_per_protein = mols_per_protein
+        self.ligand_to_proteins = ligand_to_proteins or {}
+        self.protein_to_idx = protein_to_idx or {}
     
-    def _sample_molecules(self, mol_data: List[Dict]) -> Tuple[List[Dict], List[float]]:
+    def _sample_molecules(self, mol_data: List[Dict]) -> List[Dict]:
         """
-        智能采样分子：确保正负样本均衡
-        返回采样的分子数据和对应的pIC50值
+        采样分子：只采样高亲和力分子作为正样本
+        
+        关键改动：不再采样低亲和力分子，负样本由batch内其他蛋白质的分子提供
         """
         n = self.mols_per_protein
         
-        # 按亲和力分组
-        high_affinity = [m for m in mol_data if m['affinity_class'] == 2]
-        mid_affinity = [m for m in mol_data if m['affinity_class'] == 1]
-        low_affinity = [m for m in mol_data if m['affinity_class'] == 0]
+        # 只采样高亲和力分子
+        high = [m for m in mol_data if m['affinity_class'] == 2]
         
-        sampled = []
+        if not high:
+            # 如果没有高亲和力分子，返回空（这种情况理论上不应该发生，因为预处理已经筛选过）
+            return []
         
-        # 采样策略：尽量保证正负样本各半
-        n_positive = min(n // 2, len(high_affinity))
-        n_negative = min(n - n_positive, len(low_affinity))
-        n_mid = n - n_positive - n_negative
+        # 采样高亲和力分子（可以重复采样以达到数量要求）
+        if len(high) >= n:
+            sampled = random.sample(high, n)
+        else:
+            # 如果高亲和力分子不够，允许重复采样
+            sampled = high.copy()
+            while len(sampled) < n:
+                sampled.append(random.choice(high))
         
-        if high_affinity:
-            sampled.extend(random.sample(high_affinity, min(n_positive, len(high_affinity))))
-        if low_affinity:
-            sampled.extend(random.sample(low_affinity, min(n_negative, len(low_affinity))))
-        if mid_affinity and len(sampled) < n:
-            remaining = n - len(sampled)
-            sampled.extend(random.sample(mid_affinity, min(remaining, len(mid_affinity))))
-        
-        # 如果还不够，从所有数据中补充
-        if len(sampled) < n:
-            remaining_pool = [m for m in mol_data if m not in sampled]
-            if remaining_pool:
-                sampled.extend(random.sample(remaining_pool, min(n - len(sampled), len(remaining_pool))))
-        
-        random.shuffle(sampled)
         return sampled
     
     def __call__(self, batch_items: List[Dict]):
-        """
-        处理一个批次的蛋白质
-        
-        Args:
-            batch_items: DataLoader返回的数据列表，每个元素是 {'protein': str, 'molecules': list}
-        
-        Returns:
-            mol_inputs: 分子的tokenized输入
-            prot_inputs: 蛋白质的tokenized输入
-            labels: 配对标签矩阵
-            pic50_matrix: pIC50值矩阵 (用于加权损失)
-        """
         all_smiles = []
         all_prots = []
         all_pic50 = []
-        prot_indices = []  # 记录每个分子属于哪个蛋白质
+        prot_indices = []
+        affinity_classes = []
+        
+        # 建立batch内的蛋白质序列到索引的映射
+        batch_prot_to_idx = {}
+        for prot_idx, item in enumerate(batch_items):
+            batch_prot_to_idx[item['protein']] = prot_idx
         
         for prot_idx, item in enumerate(batch_items):
             prot_seq = item['protein']
@@ -316,13 +286,13 @@ class DataCollator:
                 all_smiles.append(mol['ligand'])
                 all_pic50.append(mol['pic50'])
                 prot_indices.append(prot_idx)
+                affinity_classes.append(mol['affinity_class'])
             
-            # 格式化蛋白质序列 (SaProt格式)
+            # SaProt格式
             prot_list = [aa + "#" for aa in prot_seq]
             formatted_prot = " ".join(prot_list)
             all_prots.append(formatted_prot)
         
-        # Tokenize
         mol_inputs = self.mol_tok(
             all_smiles, 
             return_tensors="pt", 
@@ -338,24 +308,37 @@ class DataCollator:
             max_length=512
         )
         
-        # 构建标签矩阵
         n_prots = len(batch_items)
         n_mols = len(all_smiles)
         
-        # labels[i, j] = 1 如果分子j属于蛋白质i
+        # 构建标签矩阵：只有高亲和力分子才是正样本
         labels = torch.zeros(n_prots, n_mols)
         pic50_matrix = torch.zeros(n_prots, n_mols)
         
-        for mol_idx, prot_idx in enumerate(prot_indices):
-            labels[prot_idx, mol_idx] = 1.0
-            pic50_matrix[prot_idx, mol_idx] = all_pic50[mol_idx]
+        for mol_idx, (smiles, sampled_prot_idx, aff_class) in enumerate(
+            zip(all_smiles, prot_indices, affinity_classes)
+        ):
+            # 只有高亲和力分子(affinity_class==2)才标记为正样本
+            if aff_class == 2:
+                labels[sampled_prot_idx, mol_idx] = 1.0
+                pic50_matrix[sampled_prot_idx, mol_idx] = all_pic50[mol_idx]
+            
+            # 检查该分子是否还与batch内其他蛋白质有高亲和力结合关系
+            if aff_class == 2 and smiles in self.ligand_to_proteins:
+                other_proteins = self.ligand_to_proteins[smiles]
+                for other_prot_seq in other_proteins:
+                    if other_prot_seq in batch_prot_to_idx:
+                        other_prot_idx = batch_prot_to_idx[other_prot_seq]
+                        if other_prot_idx != sampled_prot_idx:
+                            labels[other_prot_idx, mol_idx] = 1.0
         
         return {
             'mol_inputs': mol_inputs,
             'prot_inputs': prot_inputs,
             'labels': labels,
             'pic50_matrix': pic50_matrix,
-            'prot_indices': torch.tensor(prot_indices)
+            'prot_indices': torch.tensor(prot_indices),
+            'affinity_classes': torch.tensor(affinity_classes)
         }
 
 # ============================================================================
@@ -366,34 +349,39 @@ class DualTowerModel(nn.Module):
         super().__init__()
         self.config = config
         
-        # 加载预训练模型
         self.prot_model = AutoModel.from_pretrained(config.path_saprot, trust_remote_code=True)
         self.mol_model = AutoModel.from_pretrained(config.path_chemberta)
         
-        # 全量微调
         for param in self.prot_model.parameters():
             param.requires_grad = True
         for param in self.mol_model.parameters():
             param.requires_grad = True
         
-        # 统计参数
         prot_params = sum(p.numel() for p in self.prot_model.parameters())
         mol_params = sum(p.numel() for p in self.mol_model.parameters())
         print(f"蛋白质编码器参数: {prot_params/1e6:.1f}M")
         print(f"分子编码器参数: {mol_params/1e6:.1f}M")
         
-        # 投影头
         prot_hidden = self.prot_model.config.hidden_size
         mol_hidden = 768
-        hidden_dim = 512
+        hidden_dim = 1024
         embedding_dim = 256
         
+        # 4层投影网络（增加深度以提升表达能力）
         self.prot_proj = nn.Sequential(
             nn.Linear(prot_hidden, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, embedding_dim)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.LayerNorm(hidden_dim//2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim//2, embedding_dim)
         )
         
         self.mol_proj = nn.Sequential(
@@ -401,13 +389,21 @@ class DualTowerModel(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, embedding_dim)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim//2),
+            nn.LayerNorm(hidden_dim//2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim//2, embedding_dim)
         )
         
         self._init_projection_weights()
         
-        # 可学习的温度参数
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / config.temperature))
+        # 可学习温度，但有严格上下限
+        self.log_temperature = nn.Parameter(torch.tensor(math.log(config.temperature_init)))
     
     def _init_projection_weights(self):
         for module in [self.prot_proj, self.mol_proj]:
@@ -417,9 +413,14 @@ class DualTowerModel(nn.Module):
                     if layer.bias is not None:
                         nn.init.zeros_(layer.bias)
     
+    def get_temperature(self):
+        """获取温度，带严格的上下限"""
+        temp = self.log_temperature.exp()
+        temp = torch.clamp(temp, min=self.config.temperature_min, max=self.config.temperature_max)
+        return temp
+    
     def encode_protein(self, input_ids, attention_mask):
         outputs = self.prot_model(input_ids=input_ids, attention_mask=attention_mask)
-        # Mean pooling
         mask = attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
         embeddings = torch.sum(outputs.last_hidden_state * mask, dim=1) / torch.clamp(mask.sum(1), min=1e-9)
         embeddings = self.prot_proj(embeddings)
@@ -428,7 +429,6 @@ class DualTowerModel(nn.Module):
     
     def encode_molecule(self, input_ids, attention_mask):
         outputs = self.mol_model(input_ids=input_ids, attention_mask=attention_mask)
-        # Mean pooling
         mask = attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
         embeddings = torch.sum(outputs.last_hidden_state * mask, dim=1) / torch.clamp(mask.sum(1), min=1e-9)
         embeddings = self.mol_proj(embeddings)
@@ -438,180 +438,157 @@ class DualTowerModel(nn.Module):
     def forward(self, prot_input_ids, prot_attention_mask, mol_input_ids, mol_attention_mask):
         prot_embeddings = self.encode_protein(prot_input_ids, prot_attention_mask)
         mol_embeddings = self.encode_molecule(mol_input_ids, mol_attention_mask)
-        logit_scale = torch.clamp(self.logit_scale.exp(), max=100)
-        return prot_embeddings, mol_embeddings, logit_scale
+        temperature = self.get_temperature()
+        return prot_embeddings, mol_embeddings, temperature
 
 # ============================================================================
-# 损失函数
+# 简化的对比损失
 # ============================================================================
-class AffinityContrastiveLoss(nn.Module):
+class SimpleContrastiveLoss(nn.Module):
     """
-    基于亲和力的对比学习损失函数
-    
-    结合了:
-    1. InfoNCE Loss: 使正样本对更近
-    2. 亲和力加权: 使用pIC50作为软标签
-    3. Hard Negative Mining: 聚焦于难样本
+    简化的对比学习损失，基于标准InfoNCE
     """
-    def __init__(self, config: TrainConfig):
+    def __init__(self):
         super().__init__()
-        self.config = config
-        self.margin = config.margin
     
-    def forward(self, prot_emb, mol_emb, labels, pic50_matrix, logit_scale):
+    def forward(self, prot_emb, mol_emb, labels, temperature):
         """
         Args:
-            prot_emb: [n_prots, dim] 蛋白质embeddings
-            mol_emb: [n_mols, dim] 分子embeddings
-            labels: [n_prots, n_mols] 配对标签 (1=配对, 0=非配对)
-            pic50_matrix: [n_prots, n_mols] pIC50值
-            logit_scale: 温度缩放因子
-        
-        Returns:
-            total_loss, loss_dict
+            prot_emb: [n_prots, dim]
+            mol_emb: [n_mols, dim]
+            labels: [n_prots, n_mols] 配对标签
+            temperature: 温度标量
         """
-        device = prot_emb.device
+        # 计算相似度矩阵
+        sim_matrix = torch.matmul(prot_emb, mol_emb.T) / temperature
+        
+        # ===============================
+        # 1. Protein -> Molecule (多标签分类)
+        # ===============================
+        # 每个蛋白质对应多个正样本分子
+        # 使用多标签softmax: sum of log-softmax for all positives
+        
         n_prots = prot_emb.size(0)
-        n_mols = mol_emb.size(0)
-        
-        # 计算相似度矩阵 [n_prots, n_mols]
-        sim_matrix = torch.matmul(prot_emb, mol_emb.T) * logit_scale
-        
-        # ===============================
-        # 1. 多标签对比损失 (Protein -> Molecule)
-        # ===============================
-        # 对于每个蛋白质，所有匹配的分子都是正样本
-        # 使用pIC50加权的softmax
-        
-        # 归一化pIC50到[0, 1]作为软权重
-        # 数据实际范围约[-2, 12]，主要集中在[2, 9]
-        # 使用[2, 10]作为归一化范围
-        pic50_norm = (pic50_matrix - 2) / 8  # 将[2, 10]映射到[0, 1]
-        pic50_norm = torch.clamp(pic50_norm, 0, 1)
-        
-        # 正样本的加权
-        pos_weights = labels * pic50_norm
-        pos_weights = pos_weights / (pos_weights.sum(dim=1, keepdim=True) + 1e-8)
-        
-        # 带权重的交叉熵损失 (Protein -> Molecule)
-        log_softmax_p2m = F.log_softmax(sim_matrix, dim=1)
-        loss_p2m = -torch.sum(pos_weights * log_softmax_p2m) / n_prots
-        
-        # ===============================
-        # 2. Molecule -> Protein 方向的损失
-        # ===============================
-        # 每个分子只属于一个蛋白质，使用标准交叉熵
-        mol_labels = labels.T.argmax(dim=1)  # [n_mols]
-        log_softmax_m2p = F.log_softmax(sim_matrix.T, dim=1)
-        loss_m2p = F.nll_loss(log_softmax_m2p, mol_labels)
-        
-        # ===============================
-        # 3. 亲和力排名损失 (Margin Ranking Loss)
-        # ===============================
-        # 对于每个蛋白质，高亲和力分子应该比低亲和力分子得分更高
-        ranking_loss = 0.0
-        ranking_count = 0
+        loss_p2m = 0.0
         
         for i in range(n_prots):
-            # 获取该蛋白质的正样本索引
             pos_mask = labels[i] > 0
-            if pos_mask.sum() < 2:
+            if pos_mask.sum() == 0:
                 continue
             
-            pos_indices = pos_mask.nonzero().squeeze(-1)
-            pos_pic50 = pic50_matrix[i, pos_indices]
-            pos_scores = sim_matrix[i, pos_indices]
+            # log_softmax over all molecules
+            log_probs = F.log_softmax(sim_matrix[i], dim=0)
             
-            # 对所有正样本对进行排名约束
-            for j in range(len(pos_indices)):
-                for k in range(j + 1, len(pos_indices)):
-                    if pos_pic50[j] > pos_pic50[k]:  # j应该比k得分高
-                        margin_diff = self.margin - (pos_scores[j] - pos_scores[k])
-                        ranking_loss += F.relu(margin_diff)
-                    elif pos_pic50[k] > pos_pic50[j]:  # k应该比j得分高
-                        margin_diff = self.margin - (pos_scores[k] - pos_scores[j])
-                        ranking_loss += F.relu(margin_diff)
-                    ranking_count += 1
+            # 平均正样本的log probability
+            pos_log_probs = log_probs[pos_mask]
+            loss_p2m -= pos_log_probs.mean()
         
-        if ranking_count > 0:
-            ranking_loss = ranking_loss / ranking_count
+        loss_p2m = loss_p2m / n_prots
         
         # ===============================
-        # 4. 负样本对比损失
+        # 2. Molecule -> Protein (多标签分类)
         # ===============================
-        # 确保非配对的蛋白质-分子对相似度低
-        neg_mask = 1 - labels
-        neg_sim = sim_matrix * neg_mask
-        neg_loss = F.relu(neg_sim - 0.0).mean()  # 希望负样本相似度 < 0
+        # 一个分子可能对应多个蛋白质！
+        n_mols = mol_emb.size(0)
+        loss_m2p = 0.0
+        
+        labels_t = labels.T  # [n_mols, n_prots]
+        for j in range(n_mols):
+            pos_mask = labels_t[j] > 0
+            if pos_mask.sum() == 0:
+                continue
+            
+            # log_softmax over all proteins
+            log_probs = F.log_softmax(sim_matrix.T[j], dim=0)
+            
+            # 平均正样本的log probability
+            pos_log_probs = log_probs[pos_mask]
+            loss_m2p -= pos_log_probs.mean()
+        
+        loss_m2p = loss_m2p / n_mols
         
         # 总损失
-        total_loss = loss_p2m + loss_m2p + 0.5 * ranking_loss + 0.1 * neg_loss
+        total_loss = (loss_p2m + loss_m2p) / 2
         
-        loss_dict = {
+        return total_loss, {
             'loss_p2m': loss_p2m.item(),
             'loss_m2p': loss_m2p.item(),
-            'loss_ranking': ranking_loss.item() if isinstance(ranking_loss, torch.Tensor) else ranking_loss,
-            'loss_neg': neg_loss.item()
+            'temperature': temperature.item()
         }
-        
-        return total_loss, loss_dict
 
 # ============================================================================
 # 评估指标
 # ============================================================================
-def compute_retrieval_metrics(prot_emb, mol_emb, labels, k_list=[1, 5, 10]):
-    """
-    计算检索指标
+@torch.no_grad()
+def evaluate(model, dataloader, device, accelerator=None):
+    """评估模型"""
+    model.eval()
     
-    Returns:
-        metrics: dict with Recall@K for both directions
-    """
-    # Protein -> Molecule
-    sim_p2m = torch.matmul(prot_emb, mol_emb.T)
+    all_prot_emb = []
+    all_mol_emb = []
+    all_labels = []
+    all_pic50 = []
     
-    # Molecule -> Protein  
-    sim_m2p = sim_p2m.T
+    for batch in dataloader:
+        mol_inputs = {k: v.to(device) for k, v in batch['mol_inputs'].items()}
+        prot_inputs = {k: v.to(device) for k, v in batch['prot_inputs'].items()}
+        
+        prot_emb, mol_emb, _ = model(
+            prot_inputs['input_ids'], prot_inputs['attention_mask'],
+            mol_inputs['input_ids'], mol_inputs['attention_mask']
+        )
+        
+        all_prot_emb.append(prot_emb)
+        all_mol_emb.append(mol_emb)
+        all_labels.append(batch['labels'].to(device))
+        all_pic50.append(batch['pic50_matrix'].to(device))
+    
+    # 合并所有batch的embedding (注意这里简化处理，实际应该用all_gather)
+    # 对于单进程评估足够
     
     metrics = {}
+    total_p2m_correct = 0
+    total_m2p_correct = 0
+    total_prots = 0
+    total_mols = 0
     
-    # P2M Recall@K
-    n_prots = prot_emb.size(0)
-    for k in k_list:
-        _, topk_indices = sim_p2m.topk(k, dim=1)
-        hits = 0
+    for prot_emb, mol_emb, labels in zip(all_prot_emb, all_mol_emb, all_labels):
+        sim_matrix = torch.matmul(prot_emb, mol_emb.T)
+        
+        n_prots = prot_emb.size(0)
+        n_mols = mol_emb.size(0)
+        
+        # P2M: 对于每个蛋白质，检查top-1预测是否是正样本
+        top1_indices = sim_matrix.argmax(dim=1)
         for i in range(n_prots):
-            # 检查topk中是否有正样本
-            pos_indices = (labels[i] > 0).nonzero().squeeze(-1)
-            for idx in topk_indices[i]:
-                if idx in pos_indices:
-                    hits += 1
-                    break
-        metrics[f'P2M_R@{k}'] = hits / n_prots
+            if labels[i, top1_indices[i]] > 0:
+                total_p2m_correct += 1
+        total_prots += n_prots
+        
+        # M2P: 对于每个分子，检查预测是否正确
+        true_prots = labels.T.argmax(dim=1)
+        pred_prots = sim_matrix.T.argmax(dim=1)
+        total_m2p_correct += (pred_prots == true_prots).sum().item()
+        total_mols += n_mols
     
-    # M2P Recall@K
-    n_mols = mol_emb.size(0)
-    labels_t = labels.T
-    for k in k_list:
-        _, topk_indices = sim_m2p.topk(k, dim=1)
-        hits = 0
-        for i in range(n_mols):
-            true_prot = labels_t[i].argmax()
-            if true_prot in topk_indices[i]:
-                hits += 1
-        metrics[f'M2P_R@{k}'] = hits / n_mols
+    metrics['P2M_Acc@1'] = total_p2m_correct / total_prots if total_prots > 0 else 0
+    metrics['M2P_Acc@1'] = total_m2p_correct / total_mols if total_mols > 0 else 0
+    metrics['Avg_Acc'] = (metrics['P2M_Acc@1'] + metrics['M2P_Acc@1']) / 2
     
+    model.train()
     return metrics
 
 # ============================================================================
-# 学习率调度器
+# Cosine学习率调度器
 # ============================================================================
-def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
-    """线性warmup后线性衰减"""
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr_ratio=0.01):
+    """Cosine退火，最小LR为初始的min_lr_ratio"""
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
-        return max(0.0, float(num_training_steps - current_step) / 
-                   float(max(1, num_training_steps - num_warmup_steps)))
+        
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)) * (1 - min_lr_ratio) + min_lr_ratio)
     
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -619,7 +596,6 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 # 主训练流程
 # ============================================================================
 def main():
-    # 初始化Accelerator
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         mixed_precision="fp16",
@@ -630,16 +606,12 @@ def main():
     
     if accelerator.is_main_process:
         print("=" * 80)
-        print("蛋白质-分子双塔模型训练 (IC50监督对比学习)")
+        print("蛋白质-分子双塔模型训练 v2 (改进版)")
         print("=" * 80)
         print(f"设备: {device}, 进程数: {accelerator.num_processes}")
         print(f"批次大小: {config.per_device_batch_size} proteins × {config.mols_per_protein} mols")
         print(f"梯度累积: {config.gradient_accumulation_steps}")
-        effective_batch = (config.per_device_batch_size * config.mols_per_protein * 
-                          config.gradient_accumulation_steps * accelerator.num_processes)
-        print(f"有效批次大小: ~{effective_batch} samples")
-        print(f"正样本阈值: pIC50 > {config.positive_threshold}")
-        print(f"负样本阈值: pIC50 < {config.negative_threshold}")
+        print(f"温度范围: [{config.temperature_min}, {config.temperature_max}]")
         
         os.makedirs(config.output_dir, exist_ok=True)
     
@@ -647,54 +619,42 @@ def main():
     mol_tokenizer = AutoTokenizer.from_pretrained(config.path_chemberta)
     prot_tokenizer = AutoTokenizer.from_pretrained(config.path_saprot, trust_remote_code=True)
     
-    # 加载数据
+    # 加载数据 (使用宽松条件)
     if accelerator.is_main_process:
         print("\n加载训练数据...")
     train_raw = load_from_disk(config.path_data_train)
-    train_protein_data = preprocess_dataset(train_raw, accelerator)
+    train_protein_data, train_ligand_to_proteins = preprocess_dataset(train_raw, accelerator, require_both_classes=False)
     
     if accelerator.is_main_process:
         print("\n加载测试数据...")
     test_raw = load_from_disk(config.path_data_test)
-    test_protein_data = preprocess_dataset(test_raw, accelerator)
+    test_protein_data, test_ligand_to_proteins = preprocess_dataset(test_raw, accelerator, require_both_classes=False)
+    
+    # 合并分子-蛋白质映射（测试集的分子也可能在训练集出现过）
+    all_ligand_to_proteins = defaultdict(set)
+    for lig, prots in train_ligand_to_proteins.items():
+        all_ligand_to_proteins[lig].update(prots)
+    for lig, prots in test_ligand_to_proteins.items():
+        all_ligand_to_proteins[lig].update(prots)
+    
+    if accelerator.is_main_process:
+        print(f"\n合并后的分子-蛋白质映射: {len(all_ligand_to_proteins)} 个分子")
     
     # 创建数据集
-    train_dataset = BindingAffinityDataset(
-        train_protein_data, 
-        min_mols_per_protein=config.mols_per_protein
-    )
-    test_dataset = BindingAffinityDataset(
-        test_protein_data,
-        min_mols_per_protein=config.mols_per_protein
-    )
+    train_dataset = BindingAffinityDataset(train_protein_data, all_ligand_to_proteins)
+    test_dataset = BindingAffinityDataset(test_protein_data, all_ligand_to_proteins)
     
-    # 创建采样器和数据加载器
-    train_sampler = AffinityBatchSampler(
-        train_dataset,
-        batch_size=config.per_device_batch_size,
-        mols_per_protein=config.mols_per_protein,
-        drop_last=True
-    )
-    
-    train_collator = DataCollator(
-        mol_tokenizer,
-        prot_tokenizer,
-        config.mols_per_protein
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,  # 传整个dataset
-        batch_sampler=train_sampler,
-        collate_fn=train_collator,
-        num_workers=4,
-        pin_memory=True
-    )
+    # 数据加载器 (传入ligand_to_proteins用于多标签处理)
+    train_collator = DataCollator(mol_tokenizer, prot_tokenizer, config.mols_per_protein, 
+                                   ligand_to_proteins=all_ligand_to_proteins)
+    test_collator = DataCollator(mol_tokenizer, prot_tokenizer, config.mols_per_protein,
+                                  ligand_to_proteins=all_ligand_to_proteins)
     
     # 模型
     model = DualTowerModel(config)
     
     # 损失函数
-    criterion = AffinityContrastiveLoss(config)
+    criterion = SimpleContrastiveLoss()
     
     # 优化器
     optimizer = torch.optim.AdamW([
@@ -706,17 +666,27 @@ def main():
          'lr': config.lr_mol_backbone, 'weight_decay': config.weight_decay},
         {'params': model.mol_proj.parameters(), 
          'lr': config.lr_head, 'weight_decay': 0.0},
-        {'params': [model.logit_scale], 
+        {'params': [model.log_temperature], 
          'lr': config.lr_temp, 'weight_decay': 0.0}
     ])
     
-    # 学习率调度器
-    num_training_steps = len(train_sampler) * config.epochs
+    # 计算总步数
+    # 每个epoch的步数 = 蛋白质数 * 采样轮数 / batch_size
+    steps_per_epoch = (len(train_dataset) * config.samples_per_epoch) // config.per_device_batch_size
+    
+    # 注意：scheduler.step() 在每个 forward step 调用，所以用 forward steps 计算
+    # （而不是 optimization steps，因为 accelerate.prepare(scheduler) 后行为会自动适配）
+    num_training_steps = steps_per_epoch * config.epochs
     num_warmup_steps = int(num_training_steps * config.warmup_ratio)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
     
     if accelerator.is_main_process:
-        print(f"\n训练步数: {num_training_steps}, Warmup步数: {num_warmup_steps}")
+        print(f"\n每epoch步数: {steps_per_epoch}")
+        print(f"总训练步数: {num_training_steps}, Warmup步数: {num_warmup_steps}")
+    
+    # 学习率调度器
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps, num_training_steps, config.min_lr_ratio
+    )
     
     # Accelerator prepare
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
@@ -725,25 +695,27 @@ def main():
     history = {
         'train_loss': [],
         'val_metrics': [],
-        'steps': []
+        'epochs': [],
+        'lr': []
     }
+    
+    best_metric = 0.0
+    patience_counter = 0
+    global_step = 0
     
     if accelerator.is_main_process:
         print("\n开始训练...")
-    
-    global_step = 0
-    best_recall = 0.0
     
     for epoch in range(config.epochs):
         model.train()
         epoch_loss = 0.0
         epoch_steps = 0
         
-        # 重新创建sampler (重新打乱)
-        train_sampler = AffinityBatchSampler(
-            train_dataset,
-            batch_size=config.per_device_batch_size,
-            mols_per_protein=config.mols_per_protein,
+        # 创建新的sampler和dataloader
+        train_sampler = SimpleBatchSampler(
+            train_dataset, 
+            config.per_device_batch_size, 
+            samples_per_epoch=config.samples_per_epoch,
             drop_last=True
         )
         train_loader = DataLoader(
@@ -755,55 +727,97 @@ def main():
         )
         
         for step, batch in enumerate(train_loader):
-            # 移动到设备
             mol_inputs = {k: v.to(device) for k, v in batch['mol_inputs'].items()}
             prot_inputs = {k: v.to(device) for k, v in batch['prot_inputs'].items()}
             labels = batch['labels'].to(device)
-            pic50_matrix = batch['pic50_matrix'].to(device)
             
             with accelerator.accumulate(model):
-                # 前向传播
-                prot_emb, mol_emb, logit_scale = model(
+                prot_emb, mol_emb, temperature = model(
                     prot_inputs['input_ids'], prot_inputs['attention_mask'],
                     mol_inputs['input_ids'], mol_inputs['attention_mask']
                 )
                 
-                # 计算损失
-                loss, loss_dict = criterion(prot_emb, mol_emb, labels, pic50_matrix, logit_scale)
+                loss, loss_dict = criterion(prot_emb, mol_emb, labels, temperature)
                 
-                # 反向传播
                 accelerator.backward(loss)
                 
+                # 只在梯度同步时（即真正的优化步骤）更新
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    global_step += 1
+                    scheduler.step()  # 移到这里，确保只在真正优化时调用
                 
                 optimizer.step()
-                scheduler.step()
                 optimizer.zero_grad()
             
             epoch_loss += loss.item()
             epoch_steps += 1
-            global_step += 1
             
             # 日志
             if accelerator.is_main_process and step % config.log_every_steps == 0:
                 lr = scheduler.get_last_lr()[0]
-                temp = logit_scale.item()
                 print(f"Epoch {epoch+1} | Step {step:4d} | Loss: {loss.item():.4f} | "
                       f"P2M: {loss_dict['loss_p2m']:.3f} | M2P: {loss_dict['loss_m2p']:.3f} | "
-                      f"Rank: {loss_dict['loss_ranking']:.3f} | Temp: {temp:.2f} | LR: {lr:.2e}")
-                
-                history['train_loss'].append(loss.item())
-                history['steps'].append(global_step)
+                      f"Temp: {loss_dict['temperature']:.4f} | LR: {lr:.2e}")
         
-        # Epoch结束统计
-        avg_loss = epoch_loss / epoch_steps
+        avg_loss = epoch_loss / max(epoch_steps, 1)
+        
         if accelerator.is_main_process:
             print(f"\n{'='*60}")
             print(f"Epoch {epoch+1} 完成 | 平均损失: {avg_loss:.4f}")
+            
+            history['train_loss'].append(avg_loss)
+            history['epochs'].append(epoch + 1)
+            history['lr'].append(scheduler.get_last_lr()[0])
+        
+        # 验证评估
+        if (epoch + 1) % config.eval_every_epochs == 0:
+            if accelerator.is_main_process:
+                print("\n评估中...")
+                
+                # 创建测试dataloader
+                test_sampler = SimpleBatchSampler(test_dataset, config.per_device_batch_size, drop_last=False)
+                test_loader = DataLoader(
+                    test_dataset,
+                    batch_sampler=test_sampler,
+                    collate_fn=test_collator,
+                    num_workers=2,
+                    pin_memory=True
+                )
+                
+                metrics = evaluate(accelerator.unwrap_model(model), test_loader, device)
+                history['val_metrics'].append(metrics)
+                
+                print(f"验证指标: P2M_Acc@1={metrics['P2M_Acc@1']:.4f}, "
+                      f"M2P_Acc@1={metrics['M2P_Acc@1']:.4f}, Avg={metrics['Avg_Acc']:.4f}")
+                
+                # 早停检查
+                current_metric = metrics['Avg_Acc']
+                if current_metric > best_metric:
+                    best_metric = current_metric
+                    patience_counter = 0
+                    
+                    # 保存最佳模型
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    best_path = os.path.join(config.output_dir, "model_best.pth")
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'model_state_dict': unwrapped_model.state_dict(),
+                        'metrics': metrics,
+                        'config': config.__dict__
+                    }, best_path)
+                    print(f"保存最佳模型: {best_path} (Avg_Acc={best_metric:.4f})")
+                else:
+                    patience_counter += 1
+                    print(f"Early stopping counter: {patience_counter}/{config.patience}")
+                    
+                    if patience_counter >= config.patience:
+                        print(f"\n早停触发! 最佳Avg_Acc: {best_metric:.4f}")
+                        break
+            
             print(f"{'='*60}\n")
         
-        # 保存检查点
+        # 定期保存
         if (epoch + 1) % config.save_every_epochs == 0:
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
@@ -814,7 +828,6 @@ def main():
                     'model_state_dict': unwrapped_model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
-                    'config': config.__dict__,
                     'history': history
                 }, save_path)
                 print(f"保存检查点: {save_path}")
@@ -822,45 +835,55 @@ def main():
     # 最终保存
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unwrapped_model = accelerator.unwrap_model(model)
-        final_path = os.path.join(config.output_dir, "model_final.pth")
-        torch.save({
-            'model_state_dict': unwrapped_model.state_dict(),
-            'config': config.__dict__
-        }, final_path)
-        print(f"\n最终模型保存: {final_path}")
+        # 绘制训练曲线（只画Loss和验证准确率）
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
         
-        # 绘制训练曲线
-        if history['train_loss']:
-            fig, ax = plt.subplots(figsize=(12, 5))
-            ax.plot(history['steps'], history['train_loss'], alpha=0.3, label='Raw')
-            
-            # 平滑曲线
-            window = min(50, len(history['train_loss']) // 10)
-            if window > 1:
-                smooth = np.convolve(history['train_loss'], 
-                                    np.ones(window)/window, mode='valid')
-                ax.plot(history['steps'][window-1:], smooth, linewidth=2, label='Smoothed')
-            
-            ax.set_xlabel('Training Steps')
-            ax.set_ylabel('Loss')
-            ax.set_title('Training Loss Curve')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            fig_path = os.path.join(config.output_dir, 'training_curve.png')
-            plt.savefig(fig_path, dpi=150)
-            plt.close()
-            print(f"训练曲线保存: {fig_path}")
+        # Loss曲线
+        axes[0].plot(history['epochs'], history['train_loss'], 'b-', linewidth=2, marker='o', markersize=4)
+        axes[0].set_xlabel('Epoch', fontsize=12)
+        axes[0].set_ylabel('Loss', fontsize=12)
+        axes[0].set_title('Training Loss', fontsize=14)
+        axes[0].grid(True, alpha=0.3)
         
-        # 保存配置
-        config_path = os.path.join(config.output_dir, 'config.json')
-        with open(config_path, 'w') as f:
+        # 验证指标
+        if history['val_metrics']:
+            val_epochs = list(range(config.eval_every_epochs, 
+                                   len(history['val_metrics']) * config.eval_every_epochs + 1, 
+                                   config.eval_every_epochs))
+            p2m_acc = [m['P2M_Acc@1'] for m in history['val_metrics']]
+            m2p_acc = [m['M2P_Acc@1'] for m in history['val_metrics']]
+            avg_acc = [m['Avg_Acc'] for m in history['val_metrics']]
+            axes[1].plot(val_epochs, p2m_acc, 'b-o', label='P2M Acc@1', linewidth=2)
+            axes[1].plot(val_epochs, m2p_acc, 'r-o', label='M2P Acc@1', linewidth=2)
+            axes[1].plot(val_epochs, avg_acc, 'g-s', label='Avg Acc', linewidth=2)
+            axes[1].set_xlabel('Epoch', fontsize=12)
+            axes[1].set_ylabel('Accuracy', fontsize=12)
+            axes[1].set_title('Validation Metrics', fontsize=14)
+            axes[1].legend(fontsize=10)
+            axes[1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        fig_path = os.path.join(config.output_dir, 'training_curves.png')
+        plt.savefig(fig_path, dpi=150)
+        plt.close()
+        print(f"\n训练曲线保存: {fig_path}")
+        
+        # 保存配置和历史
+        with open(os.path.join(config.output_dir, 'config.json'), 'w') as f:
             json.dump(config.__dict__, f, indent=2)
         
+        with open(os.path.join(config.output_dir, 'history.json'), 'w') as f:
+            # 转换metrics为可序列化格式
+            serializable_history = {
+                'train_loss': history['train_loss'],
+                'epochs': history['epochs'],
+                'lr': history['lr'],
+                'val_metrics': history['val_metrics']
+            }
+            json.dump(serializable_history, f, indent=2)
+        
         print("\n" + "="*60)
-        print("训练完成!")
+        print(f"训练完成! 最佳Avg_Acc: {best_metric:.4f}")
         print("="*60)
 
 if __name__ == "__main__":

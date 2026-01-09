@@ -3,11 +3,13 @@ models/
 
 # 数据集
 data/
+logs/
 
 # 模型权重文件
 *.pth
 *.pt
 *.bin
+*.sbatch
 
 # Python
 __pycache__/
@@ -19,6 +21,7 @@ __pycache__/
 .eggs/
 dist/
 build/
+no_used/
 
 # Jupyter
 .ipynb_checkpoints/
